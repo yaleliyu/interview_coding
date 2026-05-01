@@ -128,7 +128,12 @@ $$
 
 Both losses above are *unregularized* — the optimizer is free to grow weights as large as the data allows. With limited samples, correlated features, or perfectly separable classes (logistic regression), this can cause overfitting or even divergence. Regularization adds a penalty on the weight magnitude to bias the solution toward simpler models.
 
-> Not implemented in the current code. This section explains how it would be added.
+Both training functions accept `l1` and `l2` keyword arguments (defaults `0.0`):
+
+```python
+train_linear_regression(l2=0.1)
+train_logistic_regression(l1=0.05, l2=0.05)  # elastic net
+```
 
 ### L2 (Ridge)
 
@@ -158,14 +163,29 @@ The (sub)gradient adds $\lambda \, \mathrm{sign}(w)$. L1 induces *sparsity*: man
 
 **Elastic net** combines both: $\lambda_1 \lVert w \rVert_1 + \lambda_2 \lVert w \rVert_2^2$.
 
+### Penalty in the gradient
+
+Both penalties combine into a single `penalty` term and are folded into the gradient before the SGD step:
+
+```python
+penalty = 2 * l2 * weights + l1 * np.sign(weights)
+penalty[0] = 0  # don't regularize the bias
+gradient = x.T @ (y_hat - y) / batch_size + penalty
+weights -= lr * gradient
+```
+
+Setting `l1=0` gives pure L2, `l2=0` gives pure L1, both nonzero gives elastic net. The line `penalty[0] = 0` implements the "don't penalize the bias" practice noted below.
+
+To make the regularizer's effect visible at log time, report the data loss and the penalty value separately:
+
+```python
+reg = l2 * np.sum(weights[1:]**2) + l1 * np.sum(np.abs(weights[1:]))
+print(f"step {epoch} data_loss: {data_loss:.4f} reg: {reg:.4f}")
+```
+
 ### Practical notes
 
-- **Don't penalize the bias.** The bias term shifts the prediction globally; shrinking it toward zero biases predictions toward zero with no benefit. In code, zero out the penalty for index 0:
-  ```python
-  reg = 2 * lam * weights
-  reg[0] = 0  # don't regularize bias
-  gradient = x.T @ (y_hat - y) / batch_size + reg
-  ```
+- **Don't penalize the bias.** The bias term shifts the prediction globally; shrinking it toward zero biases predictions toward zero with no benefit. The training loops handle this by zeroing `penalty[0]` before adding to the gradient (see snippet above).
 - **Standardize features first.** L1/L2 penalize each weight equally, so feature scale directly affects how strongly each feature is regularized. Standardizing (zero mean, unit variance) puts all features on the same footing.
 - **Choose $\lambda$ by cross-validation.** A common sweep is a log-scale grid (e.g. $10^{-4}, 10^{-3}, \dots, 10^{1}$) using held-out validation loss.
 - **Same recipe for both models.** The penalty is added to whichever loss you use — MSE for linear regression, cross-entropy for logistic — so the gradient modification above is identical in both training loops.
