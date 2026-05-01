@@ -5,6 +5,52 @@ Minimal NumPy implementations of linear and logistic regression trained with min
 - `generate_data.py` — synthetic data generators for regression and classification.
 - `model.py` — training loops for both models.
 
+## Optimization: Mini-batch SGD
+
+Both models are trained by mini-batch stochastic gradient descent. The general recipe: compute the gradient of the loss on a small random subset of the data, then take a step in the direction that decreases the loss.
+
+### The update rule
+
+Given a differentiable loss $\mathcal{L}(w)$, gradient descent updates the parameters by
+
+$$
+w \leftarrow w - \eta \, \nabla_w \mathcal{L}(w),
+$$
+
+where $\eta > 0$ is the **learning rate**. Intuition: $\nabla_w \mathcal{L}$ points in the direction of fastest *increase* of the loss, so subtracting it moves toward a lower-loss region. A small enough $\eta$ guarantees the loss decreases on convex problems; too large and the iterates can oscillate or diverge.
+
+### Full-batch vs. stochastic vs. mini-batch
+
+- **Full-batch GD** computes $\nabla_w \mathcal{L}$ on all $n$ samples each step. Accurate gradient, but expensive per step.
+- **Stochastic GD (SGD)** uses one sample per step. Cheap and noisy; the noise can help escape shallow local minima (less relevant for convex losses, but useful in deep nets).
+- **Mini-batch SGD** is the compromise used here: each step uses a random subset of $B$ samples (we use $B = 32$). This keeps gradient estimates reasonably accurate while remaining cheap and providing useful stochasticity.
+
+For a mini-batch indexed by $\mathcal{B}$, the gradient estimate is
+
+$$
+\hat{g} = \frac{1}{B} \sum_{i \in \mathcal{B}} \nabla_w \ell_i(w),
+$$
+
+and the update becomes $w \leftarrow w - \eta \, \hat{g}$.
+
+### What this looks like in code
+
+```python
+idx = np.random.choice(n_samples, batch_size, replace=False)  # sample mini-batch
+x   = data[idx, :-1]                                          # inputs
+y   = data[idx,  -1]                                          # targets
+y_hat   = forward(x, weights)                                 # prediction
+gradient = x.T @ (y_hat - y) / batch_size                     # ĝ
+weights -= lr * gradient                                      # w ← w − η ĝ
+```
+
+The exact form of `forward` is the only thing that differs between the two models:
+
+- **Linear regression:** `forward(x, w) = x @ w`.
+- **Logistic regression:** `forward(x, w) = sigmoid(x @ w)`.
+
+Why the gradient takes the same shape $X^\top (\hat{y} - y) / B$ in both cases is explained in each model's theory section below.
+
 ## Linear Regression
 
 ### Theory
