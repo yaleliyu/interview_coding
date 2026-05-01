@@ -124,6 +124,52 @@ $$
 5. Every 25 steps, print the per-batch cross-entropy (with clipping inside the log).
 6. After 1000 steps, print learned vs. true weights.
 
+## Regularization
+
+Both losses above are *unregularized* — the optimizer is free to grow weights as large as the data allows. With limited samples, correlated features, or perfectly separable classes (logistic regression), this can cause overfitting or even divergence. Regularization adds a penalty on the weight magnitude to bias the solution toward simpler models.
+
+> Not implemented in the current code. This section explains how it would be added.
+
+### L2 (Ridge)
+
+Add a squared-norm penalty to the loss:
+
+$$
+\mathcal{L}_{\text{reg}}(w) = \mathcal{L}(w) + \lambda \, \lVert w \rVert_2^2.
+$$
+
+Gradient picks up an extra $2\lambda w$ term, so the update becomes
+
+$$
+w \leftarrow w - \eta \big( \hat{g} + 2\lambda w \big) = (1 - 2\eta\lambda)\, w - \eta\, \hat{g}.
+$$
+
+This is sometimes called **weight decay**: each step shrinks $w$ toward zero by a constant factor before applying the data gradient. L2 keeps all weights small but rarely makes any exactly zero. For linear regression it has a closed form ($w = (X^\top X + \lambda I)^{-1} X^\top y$). It is equivalent to MAP estimation with a Gaussian prior on $w$.
+
+### L1 (Lasso)
+
+Add an absolute-value penalty:
+
+$$
+\mathcal{L}_{\text{reg}}(w) = \mathcal{L}(w) + \lambda \, \lVert w \rVert_1.
+$$
+
+The (sub)gradient adds $\lambda \, \mathrm{sign}(w)$. L1 induces *sparsity*: many components of $w$ are driven to exactly zero, so it doubles as feature selection. It corresponds to MAP estimation with a Laplace prior. There is no closed form, and naive subgradient SGD converges slowly near zero — proximal methods (soft-thresholding) are the standard fix.
+
+**Elastic net** combines both: $\lambda_1 \lVert w \rVert_1 + \lambda_2 \lVert w \rVert_2^2$.
+
+### Practical notes
+
+- **Don't penalize the bias.** The bias term shifts the prediction globally; shrinking it toward zero biases predictions toward zero with no benefit. In code, zero out the penalty for index 0:
+  ```python
+  reg = 2 * lam * weights
+  reg[0] = 0  # don't regularize bias
+  gradient = x.T @ (y_hat - y) / batch_size + reg
+  ```
+- **Standardize features first.** L1/L2 penalize each weight equally, so feature scale directly affects how strongly each feature is regularized. Standardizing (zero mean, unit variance) puts all features on the same footing.
+- **Choose $\lambda$ by cross-validation.** A common sweep is a log-scale grid (e.g. $10^{-4}, 10^{-3}, \dots, 10^{1}$) using held-out validation loss.
+- **Same recipe for both models.** The penalty is added to whichever loss you use — MSE for linear regression, cross-entropy for logistic — so the gradient modification above is identical in both training loops.
+
 ## Caveats
 
 Issues identified during code review that are not yet fixed:
