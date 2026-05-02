@@ -42,4 +42,28 @@ def best_match_per_row(boxes_a: np.ndarray, boxes_b: np.ndarray) -> tuple[np.nda
     return np.argmax(iou, axis=1), np.max(iou, axis=1)
 
 
+import numpy as np
+
+
+def masked_mean_xy(trajectories, validity):
+    """
+    Args
+    ----
+    trajectories : np.ndarray, shape [B, A, T, 2]
+    validity     : np.ndarray (bool), shape [B, A, T]
+
+    Returns
+    -------
+    np.ndarray, shape [B, A, 2] — mean (x, y) over valid timesteps,
+    or (0, 0) if no valid timesteps exist for that agent.
+    """
+    # TODO: mask invalid positions to 0, sum, divide by count, guard against zero-count
+
+    masked = np.where(validity[..., None], trajectories, 0.0)        # [B,A,T,2]
+    summed = masked.sum(axis=-2)                                      # [B,A,2]
+    count = validity.sum(axis=-1, keepdims=True)                      # [B,A,1]
+
+    return np.where(count == 0, 0.0, summed / np.maximum(count, 1))
+
+
 
