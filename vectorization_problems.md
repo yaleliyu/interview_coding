@@ -173,3 +173,97 @@ Cleaner than scatter when input is already sorted by agent.
 
 - If your dataloader emits dense `[B, A, T, 2]` tensors with masks, keep the basic solution. Maybe switch to the `einsum` form to halve peak memory.
 - If you have control over the input pipeline and the *typical* number of observations per agent is much smaller than $T_{\max}$, change the **representation** (flat obs + scatter) before optimizing the math. The biggest win is not allocating the dense tensor in the first place.
+
+---
+
+## 3. Nearest Valid Agent to Ego
+
+### Why it matters
+
+Picking out the closest neighbor under a validity constraint is the building block for a lot of planner features — "closest lead vehicle", "nearest pedestrian", conflict detection. The trick is the **masked-argmin**: a naive `argmin` will happily pick a masked agent if its garbage coordinates happen to be close.
+
+### Task
+
+Given ego positions and other agents' positions with a validity mask, return the index of the nearest valid agent to ego for each batch element. If no valid agents exist for a batch element, return `-1` for that slot.
+
+### Shapes
+
+| Argument    | Shape       | Meaning                                              |
+|-------------|-------------|------------------------------------------------------|
+| `ego`       | `[B, 2]`    | `(x, y)` of ego per batch                            |
+| `agents`    | `[B, A, 2]` | `(x, y)` of every agent, per batch                   |
+| `validity`  | `[B, A]`    | bool — `True` if agent is present                    |
+| **return**  | `[B]`       | index into `A` of nearest valid agent, or `-1`       |
+
+### Examples
+
+**EX 1 · one valid**
+```
+ego      = [[0, 0]]
+agents   = [[[1, 0], [100, 100]]]
+validity = [[True, False]]
+→ [0]
+```
+
+**EX 2 · masked one would have won**
+```
+ego      = [[0, 0]]
+agents   = [[[0.1, 0], [5, 5]]]
+validity = [[False, True]]
+→ [1]                                # not 0 — agent 0 is masked
+```
+
+**EX 3 · no valid**
+```
+validity = [[False, False]]
+→ [-1]
+```
+
+### Reference implementation
+
+Both the top-1 and top-k variants live in [`vectorization_examples.py`](./vectorization_examples.py) as `nearest_valid_agent` and `nearest_k_valid_agents`.
+
+### Solution: top-1
+
+Three steps, all elementwise / broadcast — no Python loops over agents:
+
+```python
+ego_b = ego[:, None, :]                                   # [B, 1, 2]
+dist_sq = np.sum((ego_b - agents) ** 2, axis=-1)          # [B, A]
+masked_dist = np.where(validity, dist_sq, np.inf)         # [B, A]
+
+any_valid = validity.any(axis=-1)                         # [B]
+return np.where(any_valid, np.argmin(masked_dist, axis=-1), -1)
+```
+
+Key ideas:
+
+1. **Broadcast the ego against agents.** Inserting a singleton axis (`ego[:, None, :]` → `[B, 1, 2]`) makes the difference with `agents` (`[B, A, 2]`) broadcast cleanly to `[B, A, 2]`. Squaring and summing over the last axis gives the per-agent squared distance `[B, A]`.
+2. **Masked-argmin via `+inf` substitution.** This is the central trick. Naively, `argmin` would happily pick a masked agent if its garbage coordinates happened to lie near the ego. Replacing masked entries with `np.inf` guarantees they cannot win the argmin. (Use `np.inf`, not a finite sentinel like `1e10` — finite sentinels can be beaten by real distances in large coordinate systems.)
+3. **No-valid-agent guard.** When *every* agent in a batch row is masked, `argmin` still returns a (meaningless) `0`. Compute `validity.any(axis=-1)` separately and overwrite those rows with `-1` via `np.where`. Both branches of `np.where` always evaluate, so this costs an extra full reduction but no extra control flow.
+
+Working with squared distance throughout is intentional — `argmin` of $d^2$ and of $d$ give the same answer, and skipping the `sqrt` saves work.
+
+### Solution: top-k
+
+The top-1 idea generalizes by replacing `argmin` with a partial sort. The masked-distance setup is identical:
+
+```python
+ego_b = ego[:, None, :]
+dist_sq = np.sum((ego_b - agents) ** 2, axis=-1)          # [B, A]
+masked_dist = np.where(validity, dist_sq, np.inf)         # [B, A]
+
+k = min(k, agents.shape[1])                               # clamp if k > A
+top_k_idx = np.argsort(masked_dist, axis=-1)[:, :k]       # [B, k]
+
+top_k_dist = np.take_along_axis(masked_dist, top_k_idx, axis=-1)
+return np.where(np.isinf(top_k_dist), -1, top_k_idx)
+```
+
+Notes:
+
+1. **`-1` slots cover both edge cases for free.** If a batch row has fewer than `k` valid agents (or none at all), the trailing positions in `top_k_idx` correspond to masked agents whose distance is `np.inf`. Gathering those distances back via `take_along_axis` and checking with `np.isinf` lets a single `np.where` clear them all to `-1`. There's no separate "no valid agents" branch.
+2. **Clamp `k`.** If the caller asks for more neighbors than there are agent slots, slice `[:, :k]` would just under-fill — explicit `min(k, A)` makes the output shape predictable.
+3. **`argsort` vs. `argpartition`.** Full sort is `O(A \log A)` per row. For large `A` and small `k`, swap to `np.argpartition(masked_dist, kth=k, axis=-1)[:, :k]` (`O(A)`), then sort just the `k` selected entries. Worth it only when `A` is in the hundreds or more.
+4. **Sort stability.** `np.argsort` defaults to stable sort, so ties (equal distances) are broken by original index — usually the desired behavior. `argpartition` is unstable, so the partition variant tie-breaks arbitrarily.
+5. **Returning distances too.** If callers want both indices and distances, gather `top_k_dist` and apply `np.sqrt` *only at the end* — sorting on squared distances gives the same order, so the square root is dead work until the very last step.

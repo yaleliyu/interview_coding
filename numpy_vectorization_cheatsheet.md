@@ -257,6 +257,114 @@ mean_per_row = (x * mask).sum(axis=1) / mask.sum(axis=1)
 
 ---
 
+## `arg*` functions: indices instead of values
+
+Wherever a reduction or sort returns a *value*, an `arg*` sibling returns the *position* it came from. This is the bridge between "what's the answer" and "where in the array did it come from".
+
+### Index of the min / max
+
+```python
+# Setup: x shape [N, D]
+
+x.argmin(axis=1)                  # [N] int — column index of min in each row
+x.argmax(axis=1)                  # [N] int — column index of max in each row
+
+x.argmin()                        # scalar — flat index into x.ravel() of the global min
+np.unravel_index(x.argmin(), x.shape)   # convert flat index → (row, col) tuple
+
+# masked argmin: substitute +inf at invalid positions so they cannot win
+np.where(valid, x, np.inf).argmin(axis=1)
+# masked argmax: substitute -inf
+np.where(valid, x, -np.inf).argmax(axis=1)
+```
+
+**Gotcha — argmax of a boolean array as "first True":**
+
+```python
+mask = arr > threshold            # [N, D] bool
+first_true = mask.argmax(axis=-1) # [N] int
+
+# CAUTION: argmax returns 0 if there are NO True values in a row.
+# Always guard with .any():
+has_any = mask.any(axis=-1)
+first_true = np.where(has_any, mask.argmax(axis=-1), -1)
+```
+
+To get the *value* alongside the index in one pass, see the `take_along_axis` pattern in [Fancy indexing & gathering](#fancy-indexing--gathering).
+
+### Sort indices
+
+```python
+# Setup: x shape [N, D]
+
+np.argsort(x, axis=-1)                 # [N, D] — indices that sort each row ascending
+np.argsort(x, axis=-1)[:, ::-1]        # descending
+np.argsort(x, axis=-1, kind='stable')  # tie-break by original index (default ≥ 1.15)
+
+np.argsort(-x, axis=-1)[:, :k]         # top-k indices by descending value (full sort)
+```
+
+### Partial sort (top-k without sorting everything)
+
+`argpartition` rearranges so that the smallest `k` items are in the first `k` positions, but their order *within* those positions is unspecified.
+
+```python
+# Setup: x shape [N, M]; k = number of items wanted
+
+np.argpartition(x, k, axis=-1)         # [N, M] — first k columns hold the k smallest
+np.argpartition(x, k, axis=-1)[:, :k]  # [N, k] — top-k smallest indices (unsorted)
+
+# To get them sorted within the top-k:
+top_k = np.argpartition(x, k, axis=-1)[:, :k]
+order = np.argsort(np.take_along_axis(x, top_k, axis=-1), axis=-1)
+top_k_sorted = np.take_along_axis(top_k, order, axis=-1)
+```
+
+`argpartition` is `O(M)` per row vs. `argsort`'s `O(M log M)`. Worth it when `M` is large and `k` is small. **Note:** `argpartition` is not stable, so equal values tie-break arbitrarily.
+
+### Sort by multiple keys
+
+```python
+# Setup: primary, secondary shape [N] (1-D parallel arrays)
+
+# sort by primary, ties broken by secondary — keys passed in REVERSE precedence:
+order = np.lexsort((secondary, primary))   # [N] int
+sorted_primary   = primary[order]
+sorted_secondary = secondary[order]
+```
+
+### Where the True values live
+
+```python
+# Setup: mask shape [N, D] bool
+
+# multidimensional — tuple of index arrays, one per axis:
+rows, cols = np.where(mask)        # parallel 1-D arrays, len = num True
+mask[rows, cols]                   # → all True
+
+# same info, stacked into one [num_true, ndim] array:
+coords = np.argwhere(mask)         # [num_true, 2]
+
+# 1-D shortcut — flat indices where True:
+flat = np.flatnonzero(mask1d)      # [num_true] int
+```
+
+### Insertion index in a sorted array
+
+```python
+# Setup: sorted_arr shape [N], sorted ascending; vals shape [K]
+
+np.searchsorted(sorted_arr, vals)              # [K] — leftmost insertion index per value
+np.searchsorted(sorted_arr, vals, side='right')  # rightmost — useful for inclusive bins
+
+# Common use: bucketize values into bin edges
+bin_idx = np.searchsorted(bin_edges, vals)     # [K]
+```
+
+`searchsorted` is `O(log N)` per query — the right tool whenever you want to "find which slot does this value go in" without a Python loop.
+
+---
+
 ## Boolean masking & conditional logic
 
 ```python

@@ -66,4 +66,55 @@ def masked_mean_xy(trajectories, validity):
     return np.where(count == 0, 0.0, summed / np.maximum(count, 1))
 
 
+import numpy as np
 
+
+def nearest_valid_agent(ego, agents, validity):
+    """
+    Args
+    ----
+    ego      : np.ndarray, shape [B, 2]
+    agents   : np.ndarray, shape [B, A, 2]
+    validity : np.ndarray (bool), shape [B, A]
+
+    Returns
+    -------
+    np.ndarray (int), shape [B] — index of nearest valid agent, or -1.
+    """
+    # TODO: pairwise distances via broadcasting, set masked entries to +inf before argmin,
+    # then fix up batches with no valid agents.
+
+    ego_b = ego[:, None, :]
+
+    any_valid = np.any(validity, axis=-1)
+
+    distance = np.where(validity, np.sum((ego_b - agents)**2, axis=-1), 1e10)
+
+    return np.where(any_valid, np.argmin(distance, axis=-1), -1)
+
+
+def nearest_k_valid_agents(
+    ego: np.ndarray, agents: np.ndarray, validity: np.ndarray, k: int
+) -> np.ndarray:
+    """
+    Args
+    ----
+    ego      : np.ndarray, shape [B, 2]
+    agents   : np.ndarray, shape [B, A, 2]
+    validity : np.ndarray (bool), shape [B, A]
+    k        : int — how many neighbors to return
+
+    Returns
+    -------
+    np.ndarray (int), shape [B, k] — indices of the k nearest valid agents,
+    sorted ascending by distance. Slots without a valid agent are filled with -1.
+    """
+    ego_b = ego[:, None, :]
+    dist_sq = np.sum((ego_b - agents) ** 2, axis=-1)         # [B, A]
+    masked_dist = np.where(validity, dist_sq, np.inf)         # [B, A]
+
+    k = min(k, agents.shape[1])                               # clamp if k > A
+    top_k_idx = np.argsort(masked_dist, axis=-1)[:, :k]       # [B, k]
+
+    top_k_dist = np.take_along_axis(masked_dist, top_k_idx, axis=-1)
+    return np.where(np.isinf(top_k_dist), -1, top_k_idx)
