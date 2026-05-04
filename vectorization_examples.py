@@ -118,3 +118,66 @@ def nearest_k_valid_agents(
 
     top_k_dist = np.take_along_axis(masked_dist, top_k_idx, axis=-1)
     return np.where(np.isinf(top_k_dist), -1, top_k_idx)
+
+
+def _top_k_ade(preds: np.ndarray, conf: np.ndarray, gt: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Shared gather pipeline for the minADE / weighted-ADE family.
+
+    Returns
+    -------
+    ade      : np.ndarray, shape [B, k] — ADE per top-k prediction
+    top_conf : np.ndarray, shape [B, k] — confidence scores of those top-k preds
+    """
+    actual_k = min(k, conf.shape[-1])
+    conf_idx = np.argpartition(-conf, kth=actual_k - 1, axis=-1)[:, :actual_k]   # [B, k]
+    pred_top_k = np.take_along_axis(preds, conf_idx[..., None, None], axis=1)    # [B, k, T, 2]
+
+    dist = np.sqrt(np.sum((pred_top_k - gt[:, None, :, :]) ** 2, axis=-1))       # [B, k, T]
+    ade = np.mean(dist, axis=-1)                                                  # [B, k]
+    top_conf = np.take_along_axis(conf, conf_idx, axis=-1)                       # [B, k]
+    return ade, top_conf
+
+
+def min_ade_top_k(preds: np.ndarray, conf: np.ndarray, gt: np.ndarray, k: int = 3) -> np.ndarray:
+    """
+    Canonical minADE@K: minimum ADE over the top-k most confident predictions.
+
+    Args
+    ----
+    preds : np.ndarray, shape [B, K, T, 2]
+    conf  : np.ndarray, shape [B, K]
+    gt    : np.ndarray, shape [B, T, 2]
+    k     : int, number of top predictions to consider
+
+    Returns
+    -------
+    np.ndarray, shape [B] — min ADE over the top-k most confident preds.
+    """
+    ade, _ = _top_k_ade(preds, conf, gt, k)
+    return ade.min(axis=-1)
+
+
+def weighted_ade_top_k(preds: np.ndarray, conf: np.ndarray, gt: np.ndarray, k: int = 3) -> np.ndarray:
+    """
+    Confidence-weighted ADE over the top-k most confident predictions.
+    Weights are the softmax of the top-k confidence scores.
+
+    Args
+    ----
+    preds : np.ndarray, shape [B, K, T, 2]
+    conf  : np.ndarray, shape [B, K]
+    gt    : np.ndarray, shape [B, T, 2]
+    k     : int, number of top predictions to consider
+
+    Returns
+    -------
+    np.ndarray, shape [B] — Σ softmax(top_conf) * ADE over the top-k preds.
+    """
+    ade, top_conf = _top_k_ade(preds, conf, gt, k)
+
+    shifted = top_conf - top_conf.max(axis=-1, keepdims=True)
+    weights = np.exp(shifted)
+    weights = weights / weights.sum(axis=-1, keepdims=True)
+
+    return (weights * ade).sum(axis=-1)

@@ -267,3 +267,114 @@ Notes:
 3. **`argsort` vs. `argpartition`.** Full sort is `O(A \log A)` per row. For large `A` and small `k`, swap to `np.argpartition(masked_dist, kth=k, axis=-1)[:, :k]` (`O(A)`), then sort just the `k` selected entries. Worth it only when `A` is in the hundreds or more.
 4. **Sort stability.** `np.argsort` defaults to stable sort, so ties (equal distances) are broken by original index — usually the desired behavior. `argpartition` is unstable, so the partition variant tie-breaks arbitrarily.
 5. **Returning distances too.** If callers want both indices and distances, gather `top_k_dist` and apply `np.sqrt` *only at the end* — sorting on squared distances gives the same order, so the square root is dead work until the very last step.
+
+---
+
+## 4. minADE over Top-K Predictions
+
+### Why it matters
+
+Motion forecasting models emit multiple hypothesis trajectories per agent with confidence scores. A standard evaluation metric — **minADE@K** — takes the top-K most confident predictions and reports the minimum **average displacement error** against the ground truth. Getting the gather step right, without loops, trips up a lot of candidates.
+
+### Task
+
+Given `K` predicted trajectories per example with confidence scores, and a ground-truth trajectory, compute **minADE over the top-3 most confident predictions** for each example.
+
+ADE = mean L2 distance between a predicted trajectory and the ground truth, averaged across timesteps.
+
+### Shapes
+
+| Argument    | Shape          | Meaning                                                |
+|-------------|----------------|--------------------------------------------------------|
+| `preds`     | `[B, K, T, 2]` | `K` predicted trajectories per example                 |
+| `conf`      | `[B, K]`       | confidence scores; higher = more confident             |
+| `gt`        | `[B, T, 2]`    | ground-truth trajectory                                |
+| **return**  | `[B]`          | minADE over the top-3 predictions                      |
+
+### Examples
+
+**EX 1 · structure**
+```
+B = 2, K = 6, T = 12, 2-D positions
+→ pick the top-3 by `conf`, compute ADE for each, take min per batch
+→ shape [2], float
+```
+
+**EX 2 · edge: K = 3**
+```
+K equals 3 — use all predictions
+→ reduces to min ADE over all K predictions per batch
+```
+
+### Reference implementation
+
+Both variants live in [`vectorization_examples.py`](./vectorization_examples.py):
+
+- `min_ade_top_k` — canonical minADE@K (`ade.min(axis=-1)`)
+- `weighted_ade_top_k` — confidence-weighted ADE (`Σ softmax(top_conf) * ade`)
+
+They share a private helper `_top_k_ade` that does the gather pipeline once; only the final reduction over `k` differs.
+
+### Solution: key takeaways
+
+#### Two related metrics
+
+Once you have `ade` of shape `[B, k]` (mean L2 displacement per top-k prediction), there are two common reductions over the `k` axis:
+
+| Metric              | Formula                                  | Interpretation                                                  |
+|---------------------|------------------------------------------|-----------------------------------------------------------------|
+| **minADE@K** (canonical) | `ade.min(axis=-1)`                  | optimistic — rewards the model if any of its top-K is close     |
+| **Weighted ADE**    | `(softmax(conf_topk) * ade).sum(axis=-1)` | calibrated — penalizes confidence spent on bad predictions     |
+
+Both share the same gather pipeline; only the last reduction differs. The reference implementation shows the weighted form.
+
+#### 1. Gathering with `take_along_axis`
+
+The index array must match the *rank* of the source array. `preds` has shape `[B, K, T, 2]`, but the top-k indices come back as `[B, k]`. To gather along axis 1, expand the index to broadcast over the trailing axes:
+
+```python
+conf_idx   = np.argpartition(-conf, kth=k-1, axis=-1)[:, :k]      # [B, k]
+pred_top_k = np.take_along_axis(preds, conf_idx[..., None, None], axis=1)  # [B, k, T, 2]
+```
+
+This is where most bugs hide. The shape of the *index* must equal the shape of the *output*, with `1`s in the trailing dims that should broadcast.
+
+#### 2. `argpartition` vs. `argsort`
+
+`argpartition` is `O(K)` average via Quickselect (Introselect in NumPy gives `O(K)` worst case). `argsort` is `O(K log K)`. For minADE the top-k set doesn't need to be ordered internally, so `argpartition` is the right call. Only worth it at large `K` (e.g. diffusion models sampling 512+ hypotheses); below ~100, the difference is invisible.
+
+#### 3. `k > K` guard
+
+Always clamp or raise explicitly:
+
+```python
+actual_k = min(k, conf.shape[-1])
+```
+
+`np.argpartition` with `kth ≥ K` produces silent wrong behavior that's painful to debug. The clamp is a one-liner — never skip it.
+
+#### 4. Weighted variant: shape and order discipline
+
+For the weighted form, compute ADE first as `[B, k]`, then gather the matching top-k confidences (using the **same** index array), softmax those weights, multiply elementwise, sum over `k`:
+
+```python
+ade        = dist.mean(axis=-1)                               # [B, k]   temporal mean first
+top_conf   = np.take_along_axis(conf, conf_idx, axis=-1)      # [B, k]
+weights    = softmax(top_conf)                                # [B, k]
+weighted   = (weights * ade).sum(axis=-1)                     # [B]
+```
+
+**Order matters.** Weighting before the temporal mean (e.g. multiplying weights into the per-timestep distances) gives a different and incorrect result — the weights are over predictions, not over timesteps.
+
+#### 5. Numerically stable softmax
+
+Always subtract the row max before exponentiating:
+
+```python
+def softmax(x, axis=-1):
+    x = x - x.max(axis=axis, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=axis, keepdims=True)
+```
+
+Prevents overflow when confidence scores are large or unbounded (logits straight from a model).
