@@ -181,3 +181,49 @@ def weighted_ade_top_k(preds: np.ndarray, conf: np.ndarray, gt: np.ndarray, k: i
     weights = weights / weights.sum(axis=-1, keepdims=True)
 
     return (weights * ade).sum(axis=-1)
+
+
+def nms(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.ndarray:
+    """
+    Args
+    ----
+    boxes      : np.ndarray, shape [N, 4], (x1, y1, x2, y2)
+    scores     : np.ndarray, shape [N]
+    iou_thresh : float
+
+    Returns
+    -------
+    np.ndarray (int), shape [K] — kept indices, score-descending.
+    """
+    def calc_area(box) -> np.ndarray:
+        return np.maximum(0, (box[:, 2] - box[:, 0])) * np.maximum(0, (box[:, 3] - box[:, 1]))
+
+    def calc_iou(box_a, box_b):
+        area_a = calc_area(box_a)
+        area_b = calc_area(box_b)
+
+        bl = np.maximum(box_a[:, :2], box_b[:, :2])
+        tr = np.minimum(box_a[:, 2:], box_b[:, 2:])
+        wh = np.clip(tr - bl, a_min=0, a_max=None)
+        intersection = wh[:, 0] * wh[:, 1]
+
+        return intersection / (area_a + area_b - intersection + 1e-8)
+
+    if scores.shape[0] == 0:
+        return np.array([], dtype=np.int64)
+
+    mask = np.full_like(scores, True, dtype=bool)
+    kept_indices = []
+
+    while np.any(mask):
+        max_idx = np.argmax(np.where(mask, scores, -np.inf))
+        kept_indices.append(max_idx)
+        mask[max_idx] = False
+
+        box = boxes[max_idx]
+        remain_idx = np.flatnonzero(mask)
+        iou = calc_iou(box[None, :], boxes[remain_idx])
+        iou_above = np.flatnonzero(iou >= iou_thresh)
+        mask[remain_idx[iou_above]] = False
+
+    return np.array(kept_indices, dtype=np.int64)

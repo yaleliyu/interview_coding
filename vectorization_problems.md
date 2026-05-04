@@ -378,3 +378,108 @@ def softmax(x, axis=-1):
 ```
 
 Prevents overflow when confidence scores are large or unbounded (logits straight from a model).
+
+---
+
+## 5. Non-Maximum Suppression (NMS)
+
+### Why it matters
+
+The canonical detection post-processing algorithm. It's a great interview problem because it sits at the boundary of algorithm and tensor ops — you need one controlled outer loop (or a clever trick), but every operation inside it should be vectorized across the remaining boxes. Candidates who reach for a double loop here are flagged.
+
+### Task
+
+Implement greedy NMS: repeatedly pick the highest-scoring remaining box, suppress all remaining boxes with `IoU ≥ threshold` against it, and continue until no boxes remain. Return the indices of kept boxes in the order they were picked.
+
+### Shapes
+
+| Argument      | Shape    | Meaning                                              |
+|---------------|----------|------------------------------------------------------|
+| `boxes`       | `[N, 4]` | `(x1, y1, x2, y2)`                                   |
+| `scores`      | `[N]`    | detection scores; higher = better                    |
+| `iou_thresh`  | scalar   | e.g. `0.5`                                           |
+| **return**    | `[K]`    | kept indices (into `N`), ordered by score descending |
+
+### Examples
+
+**EX 1 · two nearly identical boxes**
+```
+boxes  = [[0, 0, 10, 10], [0, 0, 10, 10]]
+scores = [0.9, 0.8]
+thresh = 0.5
+→ [0]                                # box 1 is suppressed by box 0
+```
+
+**EX 2 · disjoint boxes**
+```
+two non-overlapping boxes
+→ both kept, ordered by score
+```
+
+### Reference implementation
+
+A NumPy implementation lives in [`vectorization_examples.py`](./vectorization_examples.py) as `nms`.
+
+### Solution
+
+The shape of the algorithm is **one controlled outer loop, fully vectorized inside**. Track which boxes are still alive with a boolean `mask` of shape `[N]`. Each iteration:
+
+1. **Pick the highest-scoring survivor** with a masked argmax.
+2. **Mark it kept**, then take it out of the mask.
+3. **Compute IoU** between that one box and *all* the remaining alive boxes — broadcast, no per-box loop.
+4. **Suppress** the alive boxes whose IoU clears the threshold.
+
+```python
+mask = np.ones(len(boxes), dtype=bool)
+kept = []
+
+while mask.any():
+    # 1. masked argmax — substitute -inf at dead positions so they cannot win
+    max_idx = np.argmax(np.where(mask, scores, -np.inf))
+    kept.append(max_idx)
+    mask[max_idx] = False                         # take the picked box out
+
+    # 3. IoU of the picked box vs every still-alive box
+    remain = np.flatnonzero(mask)                 # [R] global indices of survivors
+    iou = pairwise_iou(boxes[max_idx][None, :], boxes[remain])   # [R]
+
+    # 4. suppress survivors above threshold
+    suppressed = np.flatnonzero(iou >= iou_thresh)               # [S] local idx into remain
+    mask[remain[suppressed]] = False              # translate local → global, then mask
+```
+
+Two patterns to highlight:
+
+- **Masked argmax via `±inf` substitution.** Same trick used in Problem 3: `np.where(mask, scores, -np.inf)` makes dead positions unable to win the `argmax`. Avoids materializing a smaller array of just-alive scores and re-mapping indices afterward.
+- **Local-to-global index translation.** `np.flatnonzero(iou >= iou_thresh)` gives positions *within the survivor list*, which then index into `remain` to recover the original `[N]`-space indices: `mask[remain[suppressed]] = False`. This two-step indirection is what lets the inner work stay fully vectorized while still updating the global mask correctly.
+
+### Caveats
+
+- **Greedy suppression is order-dependent.** Two boxes with very close scores can give different kept sets depending on tie-breaking. `np.argmax` returns the *first* maximum on ties, which is deterministic but arbitrary. If you need stable behavior across reorderings, sort boxes upfront with a stable secondary key (e.g. by `(score, idx)`).
+- **`IoU >= threshold` vs `>`.** With `>=`, a box that exactly equals the threshold is suppressed; with `>`, it survives. Inconsistencies between training and inference here cause silent eval drift. Pick one and document it.
+- **IoU epsilon.** `inter / (a + b - inter + 1e-8)` guards against `0/0` for degenerate boxes (zero area). Without the epsilon, `nan` propagates through the comparison and the mask. Don't use `1e-12` — at float32 it's noise; `1e-8` is safe and never affects real IoU values.
+- **Empty input.** `while mask.any()` already handles `N=0` once you also early-return on empty input (otherwise the initial `np.argmax([])` raises). The reference does this with an explicit `if scores.shape[0] == 0` guard.
+- **Complexity.** Worst case `O(N²)`: each iteration scans the whole mask for the next max and computes IoU against all survivors. Pre-sorting by score once turns the outer loop into a single forward pass over `argsort(-scores)` and removes the per-iteration argmax scan — same asymptotic worst case but tighter constant. Worth doing only when `N` is in the thousands. For class-aware NMS over large detection sets, look at `torchvision.ops.batched_nms` instead.
+- **Float dtype matters.** Mixing `int` boxes with `float` IoU computations works, but the `+1e-8` epsilon won't survive integer arithmetic. Cast `boxes` to float at the entry point if you accept integer coordinates.
+
+### Cleanup applied: `np.argwhere(...).flatten()` → `np.flatnonzero(...)`
+
+The first pass of the implementation used:
+
+```python
+remain_idx = np.argwhere(mask).flatten()
+iou_above  = np.argwhere(iou >= iou_thresh).flatten()
+```
+
+Replaced with:
+
+```python
+remain_idx = np.flatnonzero(mask)
+iou_above  = np.flatnonzero(iou >= iou_thresh)
+```
+
+Why it's better:
+
+- **Semantics match intent.** `np.argwhere(cond)` returns a `[num_true, ndim]` array — for an N-D array it gives one row of coordinates per True element. Calling `.flatten()` afterward only makes sense for 1-D input, where the second dimension is a single column. `np.flatnonzero` is the dedicated 1-D version: it returns the flat integer indices directly. The name describes the intent ("flat nonzero indices") and you can't accidentally use it on the wrong rank.
+- **One allocation instead of two.** `argwhere` builds the 2-D coordinate array, then `.flatten()` allocates a 1-D copy. `flatnonzero` produces the 1-D result in one step.
+- **Idiomatic.** Whenever you see `np.argwhere(...).flatten()` (or `np.where(...)[0]`) on a 1-D condition, that's the signal to reach for `np.flatnonzero`. They're aliases in semantics, but `flatnonzero` is what the rest of the NumPy ecosystem uses.
