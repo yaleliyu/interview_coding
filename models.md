@@ -1,9 +1,14 @@
-# Linear & Logistic Regression from Scratch
+# Models from Scratch
 
-Minimal NumPy implementations of linear and logistic regression trained with mini-batch SGD on synthetic data. Files:
+Minimal NumPy implementations of common ML models, used as references for the math and implementation patterns.
+
+- **Linear regression** and **logistic regression** — gradient-trained, parametric. See *Optimization*, *Linear Regression*, *Logistic Regression*, *Regularization*.
+- **K-nearest neighbours (KNN)** — non-parametric, lazy classifier. See *K-Nearest Neighbors*.
+
+Files:
 
 - `generate_data.py` — synthetic data generators for regression and classification.
-- `model.py` — training loops for both models.
+- `model.py` — training loops and the `KNNClassifier` class.
 
 ## Optimization: Mini-batch SGD
 
@@ -190,7 +195,116 @@ print(f"step {epoch} data_loss: {data_loss:.4f} reg: {reg:.4f}")
 - **Choose $\lambda$ by cross-validation.** A common sweep is a log-scale grid (e.g. $10^{-4}, 10^{-3}, \dots, 10^{1}$) using held-out validation loss.
 - **Same recipe for both models.** The penalty is added to whichever loss you use — MSE for linear regression, cross-entropy for logistic — so the gradient modification above is identical in both training loops.
 
-## Caveats
+## K-Nearest Neighbors (KNN)
+
+### Theory
+
+KNN is a **non-parametric, instance-based** classifier — there's no model in the parametric sense. Training is just "store the data"; all the work happens at query time.
+
+To predict the label of a query point $x$:
+
+1. Compute the distance from $x$ to every training point.
+2. Take the $k$ closest training points.
+3. Output the most frequent label among them (majority vote).
+
+Properties:
+
+- No "training" cost beyond memorising the data: $\mathcal{O}(N \cdot D)$ storage.
+- All cost is at query time: $\mathcal{O}(N \cdot D)$ per query.
+- No assumptions about data distribution — a *lazy* learner.
+- Decision boundaries are arbitrarily complex (driven by data, not parameters).
+
+### Reference implementation
+
+`KNNClassifier` in `model.py`:
+
+```python
+clf = KNNClassifier()
+clf.fit(X_train, y_train)
+preds = clf.predict(X_test, k=5)
+```
+
+`predict` is fully vectorised — no Python loops over points or neighbours.
+
+### Implementation walkthrough
+
+```python
+# 1. Pairwise squared distances:                            [M, N]
+dist_sqr = ((X_test[:, None, :] - self.X[None, :, :]) ** 2).sum(axis=-1)
+
+# 2. Indices of the k nearest training points per query:   [M, k]
+top_k = np.argpartition(dist_sqr, kth=k - 1, axis=-1)[:, :k]
+
+# 3. Majority vote via one-hot + sum:
+top_k_y = self.y[top_k]                                       # [M, k]
+C = int(self.y.max()) + 1
+votes = np.eye(C, dtype=np.int64)[top_k_y].sum(axis=1)        # [M, C]
+return votes.argmax(axis=-1).astype(self.y.dtype)
+```
+
+Three patterns to highlight:
+
+- **Squared distance, not Euclidean.** `argmin` of $\lVert \cdot \rVert^2$ and $\lVert \cdot \rVert$ give the same answer, so `np.sqrt` is dead work. Only re-introduce it when you need actual distance values (thresholds, RBF kernels, returning distances to the caller).
+- **`argpartition`, not `argsort`.** $\mathcal{O}(N)$ average via Quickselect vs $\mathcal{O}(N \log N)$. We need the *set* of $k$ nearest, not their order — partial sort is the right primitive.
+- **`np.eye(C)[labels]` for voting.** Fancy-indexing the identity matrix one-hot encodes; summing across the $k$ axis gives per-class vote counts. See [`np.eye`, one-hot, and voting](./numpy_vectorization_cheatsheet.md#npeye-one-hot-and-voting) in the cheatsheet.
+
+### Caveats / bugs to fix
+
+- **`k > N` not handled.** `np.argpartition(..., kth=k - 1)` raises `IndexError` for an out-of-range `kth`. Either clip `k = min(k, N)` (silent fallback) or raise a descriptive `ValueError`. The current default of "implicit IndexError" is hard to debug.
+- **`y` dtype not validated.** Both `np.bincount` and `np.eye(C)[y]` indexing require **non-negative integer** labels. Negative labels (e.g., `-1`) and float labels will fail loudly or silently corrupt the votes. Add a check in `fit`, or remap labels via `np.unique(y, return_inverse=True)` and store the reverse map for output.
+- **`n_classes` not stored.** When the test set's top-$k$ neighbours don't span all training classes, a per-row `np.bincount(row)` (without `minlength`) returns variable-length vote arrays, breaking vectorisation. The fix is to store `self.n_classes = int(y.max()) + 1` in `fit` and pass it as `minlength` (or as `C` in the `np.eye` form). The current code recomputes `C` per call, which is fine but wasteful.
+- **Tie-breaking is by smallest class index.** `votes.argmax(axis=-1)` returns the first maximum on ties. Common alternatives: weight votes by inverse distance, or break ties by the closest neighbour's label.
+- **`predict` before `fit`.** Calling `predict` before `fit` raises `AttributeError: 'KNNClassifier' object has no attribute 'X'`. A one-line guard or an `__init__` that initialises `self.X = self.y = None` makes the failure mode explicit.
+
+### Complexity
+
+- **Time:** $\mathcal{O}(M \cdot N \cdot D)$, dominated by the pairwise distance computation. `argpartition` is $\mathcal{O}(M \cdot N)$. The vote step is $\mathcal{O}(M \cdot k \cdot C + M \cdot C)$ — typically negligible.
+- **Space:** $\mathcal{O}(M \cdot N \cdot D)$ — *not* the distance matrix. The real memory cliff is the broadcast intermediate `X_test[:, None, :] - self.X[None, :, :]`, which materialises a `[M, N, D]` tensor before the squared-sum reduction.
+
+### Scaling
+
+Mitigations to the naive memory and time cost, in order of effort:
+
+1. **Inner-product trick to avoid the `[M, N, D]` intermediate.** Use the identity $\lVert a - b \rVert^2 = \lVert a \rVert^2 + \lVert b \rVert^2 - 2 \, a \cdot b$ to compute distances via BLAS:
+   ```python
+   sq_a  = (X_test ** 2).sum(axis=-1)        # [M]
+   sq_b  = (self.X  ** 2).sum(axis=-1)       # [N]
+   cross = X_test @ self.X.T                 # [M, N]   ← BLAS
+   dist_sqr = sq_a[:, None] + sq_b[None, :] - 2 * cross
+   ```
+   Same result; only `[M, N]` is allocated, and `@` dispatches to BLAS — typically much faster.
+
+2. **Batch `X_test` (large $M$).** Process queries in chunks to cap peak memory:
+   ```python
+   batch_size = memory_budget_bytes // (N * D * 8)   # 8 bytes per float64
+   ```
+   A default of 512–1000 is reasonable. Same time complexity, but bounded memory.
+
+3. **Tree methods (large $N$, low-to-moderate $D$).** Build a spatial index over training data once, query in sublinear time:
+   - `sklearn.neighbors.BallTree` and `KDTree` — build $\mathcal{O}(N \log N)$, query $\mathcal{O}(D \log N)$ per point.
+   - Worthwhile when $N$ is in the hundreds of thousands or more.
+
+4. **High-dimensional input (curse of dimensionality).** Tree methods degrade to linear scan above roughly 20–30 dimensions because nearly every cell of the tree gets visited. The production answer at scale is **approximate nearest neighbours**:
+   - **FAISS** — IVF + product quantisation, GPU support.
+   - **HNSW** — hierarchical small-world graphs.
+   - **ScaNN** — anisotropic quantisation.
+   
+   These give good-enough neighbours at orders-of-magnitude lower cost, at the price of recall < 100%.
+
+> **Coarse-to-fine heuristic:** find candidate classes via centroid distance, then run KNN within those. Creative but not exact — breaks down with overlapping or non-convex class geometry. Don't reach for it unless you've measured that approximate neighbours are acceptable for your task.
+
+### Discussion questions
+
+Worth being able to answer cleanly:
+
+- **Why `argpartition` over `argsort`?** $\mathcal{O}(N)$ average vs $\mathcal{O}(N \log N)$. We only need the *set* of $k$ nearest, not their order.
+- **When does `sqrt` matter for distance?** Not for `argmin`/`argmax` — square root is monotonic, so ordering is preserved. It matters when you're computing actual distance values (thresholds, RBF kernels, exposed to the caller).
+- **What is the full time and space complexity?** Don't forget $D$. Both are $\mathcal{O}(M \cdot N \cdot D)$ with the broadcast form. The inner-product trick keeps time at $\mathcal{O}(M \cdot N \cdot D)$ but drops memory to $\mathcal{O}(M \cdot N)$.
+- **When do tree methods stop helping?** Above roughly 20–30 dimensions.
+- **Production path for exact KNN at scale?** `sklearn.neighbors.BallTree` (or `KDTree`) for moderate $N$ and $D$; otherwise shard the data.
+- **Production path when approximate is acceptable?** FAISS or HNSW.
+
+## Caveats: Linear / Logistic Regression
 
 Issues identified during code review that are not yet fixed:
 

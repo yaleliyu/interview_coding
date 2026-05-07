@@ -227,3 +227,31 @@ def nms(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float) -> np.ndarray:
         mask[remain_idx[iou_above]] = False
 
     return np.array(kept_indices, dtype=np.int64)
+
+
+import numpy as np
+
+
+def pad_and_reduce(arrays):
+    """
+    arrays : list of np.ndarray, each shape [n_i, D]; n_i varies, D shared.
+
+    Returns
+    -------
+    padded         : [L, max_n, D]
+    mask           : [L, max_n]   bool
+    per_array_mean : [L, D]       (masked mean over time)
+    """
+    # TODO: build the padded tensor + mask, then masked-reduce.
+    # Watch the empty-row case: don't divide by 0.
+
+    lengths = np.array([len(r) for r in arrays])  # (L:)
+    max_n = max(lengths)
+
+    padded_arrays = [np.pad(d, ((0, max_n - len(d)), (0, 0))) for d in arrays]  # (L, max_n, D)
+
+    padded = np.stack(padded_arrays)
+    mask = lengths[:, None] > np.arange(max_n)[None, :]
+    per_array_mean = np.sum(padded, axis=1) / np.maximum(lengths[:, None], 1.0)
+
+    return padded, mask, per_array_mean

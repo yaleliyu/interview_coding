@@ -458,16 +458,85 @@ lse = m.squeeze(axis) + np.log(np.exp(z - m).sum(axis=axis))   # [N]
 
 ---
 
-## One-hot, indicator masks
+## `np.eye`, one-hot, and voting
+
+### What `np.eye` does
+
+`np.eye(N)` returns the `N×N` identity matrix — a square float array with ones on the diagonal and zeros elsewhere:
 
 ```python
-y = np.array([1, 0, 2, 1])          # labels, shape [N]
-C = 3                                # num classes
+np.eye(3)
+# array([[1., 0., 0.],
+#        [0., 1., 0.],
+#        [0., 0., 1.]])
+```
 
-one_hot = np.eye(C)[y]              # [N, C]
-# or:
+Generalisations:
+
+```python
+np.eye(3, 4)             # non-square: [3, 4], ones on the main diagonal
+np.eye(4, k=1)           # off-diagonal at offset +1 (above main diagonal)
+np.eye(4, k=-1)          # off-diagonal at offset -1 (below main diagonal)
+np.eye(C, dtype=np.int64)  # control dtype (default is float64)
+np.identity(3)           # alias for np.eye(3) — square only, no offset/dtype options
+```
+
+`k=±1` is occasionally useful for shift operators or finite-difference matrices; otherwise the unparameterised `np.eye(N)` is what you'll reach for 95% of the time.
+
+### Why it's the canonical one-hot trick
+
+The `i`-th row of `np.eye(C)` is the one-hot vector for class `i` — a `C`-vector with a single `1` at position `i`. Fancy-indexing the identity matrix with a 1-D array of labels picks out one row per label, all at once:
+
+```python
+# Setup: y shape [N] int labels in [0, C); C = number of classes
+
+one_hot = np.eye(C)[y]              # [N, C] — row i is the one-hot of y[i]
+```
+
+Worked example (`C = 3`, `y = [1, 0, 2, 1]`):
+
+```
+np.eye(3)            np.eye(3)[y]     (= np.eye(3)[[1,0,2,1]])
+[[1, 0, 0],          [[0, 1, 0],     ← row 1 of eye
+ [0, 1, 0],     →     [1, 0, 0],     ← row 0
+ [0, 0, 1]]           [0, 0, 1],     ← row 2
+                      [0, 1, 0]]     ← row 1
+```
+
+Equivalent broadcast form (no `np.eye` allocation, useful when `C` is large or labels are non-contiguous integers):
+
+```python
 one_hot = (y[:, None] == np.arange(C)[None, :]).astype(np.float32)
 ```
+
+### One-hot + sum = vote counting
+
+The most common production use is **counting per-row class frequencies** — e.g. KNN majority vote, segmentation pixel histograms, multi-label aggregation. One-hot the labels, then sum out the per-row axis:
+
+```python
+# Setup: top_k_y shape [M, k] int labels in [0, C); C = number of classes
+
+votes = np.eye(C, dtype=np.int64)[top_k_y].sum(axis=1)   # [M, C]
+preds = votes.argmax(axis=-1)                            # [M] — most-common class per row
+```
+
+Walkthrough:
+
+- `np.eye(C)[top_k_y]` shape `[M, k, C]` — one-hot encoding of every label in the `[M, k]` grid.
+- `.sum(axis=1)` collapses the `k` axis → `[M, C]` vote counts per row.
+- `argmax(axis=-1)` picks the winner per row.
+
+### When *not* to use `np.eye`
+
+The `[M, k, C]` intermediate from `np.eye(C)[top_k_y]` allocates `M·k·C` elements. When `C` is large (think millions of classes for a vocabulary), this dominates memory. Use the offset-`np.bincount` trick instead, which only allocates `[M, C]`:
+
+```python
+M, C = top_k_y.shape[0], int(top_k_y.max()) + 1
+offset = np.arange(M)[:, None] * C
+counts = np.bincount((top_k_y + offset).ravel(), minlength=M * C).reshape(M, C)
+```
+
+For typical `C` (`≲` a few thousand), the `np.eye` approach is faster and dramatically more readable — prefer it.
 
 ---
 

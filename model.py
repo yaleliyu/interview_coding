@@ -68,7 +68,26 @@ def train_logistic_regression(l1: float = 0.0, l2: float = 0.0) -> np.ndarray:
     return weights
 
 
+class KNNClassifier:
+    def fit(self, X, y):
+        self.X = np.asarray(X)
+        self.y = np.asarray(y)
 
+    def predict(self, X_test, k):
+        """
+        X_test : [M, D]
+        k      : positive int, k <= N
+        Returns : [M] integer labels.
+        """
+        # TODO: compute pairwise distances [M, N], take top-k, vote.
+
+        dist_sqr = np.sum((X_test[:, None, :] - self.X[None, :, :]) ** 2, axis=-1)  # [M, N] O(M*N*k)
+        top_k = np.argpartition(dist_sqr, axis=-1, kth=k - 1)[:, :k]  # [M, k], O(M*N)
+        top_k_y = self.y[top_k]  # [M, k]
+
+        C = int(self.y.max()) + 1
+        votes = np.eye(C, dtype=np.int64)[top_k_y].sum(axis=1)  # [M, C]
+        return votes.argmax(axis=-1).astype(self.y.dtype)
 
 
 if __name__ == "__main__":
