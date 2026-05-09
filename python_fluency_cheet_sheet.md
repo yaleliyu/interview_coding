@@ -1904,3 +1904,183 @@ Don't call `asyncio.run` from inside a running loop — it errors. From inside a
 ### TL;DR
 
 > `async def` produces a coroutine; `await` suspends until it (or another awaitable) is done; the event loop schedules everything on a single thread. Concurrency comes from creating **tasks**, not from the keyword `async` itself. Never block the loop, always re-raise `CancelledError`, and prefer `TaskGroup` over `gather` when you can.
+
+## 31. The GIL & Python's memory model
+
+### What the GIL is
+
+The **Global Interpreter Lock** is a single mutex inside CPython that guarantees **only one thread executes Python bytecode at a time**. It's a property of CPython, not the language — alternatives like Jython and IronPython don't have one. PyPy has it; recent CPython has an experimental free-threaded build that removes it (see end of section).
+
+```
+Thread A: BYTECODE BYTECODE BYTECODE  [release GIL on I/O]
+Thread B:                              BYTECODE BYTECODE BYTECODE
+Thread C:                                                          BYTECODE ...
+```
+
+So even on a 16-core machine, pure-Python threaded code uses **one core for bytecode execution** — the rest of the cores sit idle for that work.
+
+### Why it exists
+
+CPython manages memory primarily by **reference counting**: every object has a `Py_REFCNT` field. Every assignment, function call, return, and `del` adjusts these counts:
+
+```python
+x = obj           # incref obj
+y = x             # incref obj (now refcount 3 if it was 1)
+del x             # decref obj
+del y             # decref → 0 → free
+```
+
+If two threads incremented/decremented the same refcount **without a lock**, you'd get races — objects freed while still in use, or memory leaked. The GIL is the cheap-and-cheerful answer: lock the whole interpreter so refcounts never race. Removing it requires per-object locking or atomic refcounts (which is what PEP 703 does), and historically that made single-threaded code 10–30% slower — which is why the GIL stuck around.
+
+### When the GIL is released
+
+A thread holds the GIL until **one of these** happens:
+1. **A blocking I/O call** — `read`, `recv`, `send`, `select`, `time.sleep`, `os.system`, subprocess waits. CPython explicitly drops the GIL around these so other threads can run during the wait.
+2. **A GIL-releasing C extension** — NumPy matrix ops, PyTorch tensor ops, `hashlib.sha256`, `zlib.compress`, `lz4`, image libs, BLAS calls. They explicitly drop and reacquire around CPU work.
+3. **A scheduling tick** — every ~5 ms (set by `sys.setswitchinterval`, default 0.005s), the running thread voluntarily yields, allowing the OS to pick another GIL-waiting thread. Older CPython (pre-3.2) yielded every 100 bytecodes; modern CPython yields by wall time.
+
+That's why **threading helps for I/O** and for **NumPy/PyTorch**, but not for tight Python loops.
+
+```python
+# This benefits from threading: GIL released during recv()
+threads do: requests.get(url)
+
+# This does NOT: GIL is held throughout
+threads do: sum(i*i for i in range(10**7))
+
+# This DOES: NumPy releases the GIL inside dot()
+threads do: np.dot(big_a, big_b)
+```
+
+### Atomicity — what is and isn't atomic
+
+The GIL guarantees that a **single bytecode** runs without interruption — but most "operations" are several bytecodes.
+
+**Atomic** (single bytecode, safe between threads):
+```python
+x = y                   # LOAD_FAST + STORE_FAST
+d[k] = v                # STORE_SUBSCR (when d is a built-in dict, k/v already evaluated)
+list.append(item)       # CALL on a C-implemented method
+list.extend(other)
+dict.setdefault(k, v)
+```
+
+**NOT atomic** (multiple bytecodes — interruptible):
+```python
+counter += 1            # LOAD, LOAD_CONST 1, BINARY_ADD, STORE  → race window
+d[k] += 1               # LOAD k, GET, ADD, STORE k             → race window
+if x not in s: s.add(x) # LOAD, IN, JUMP, CALL                  → check-then-act race
+```
+
+The classic threaded counter bug:
+```python
+counter = 0
+def inc():
+    global counter
+    for _ in range(100_000):
+        counter += 1
+
+ts = [threading.Thread(target=inc) for _ in range(10)]
+for t in ts: t.start()
+for t in ts: t.join()
+print(counter)        # often < 1_000_000 — lost increments
+```
+
+For anything more than a single attribute write, **use a lock** (`threading.Lock`), an atomic primitive (`queue.Queue`, `multiprocessing.Value`), or — better — design state as message-passing.
+
+> **Rule:** "Python is interpreted, so it must be safe" is wrong. The GIL prevents memory corruption inside individual operations. It does **not** make read-modify-write sequences atomic.
+
+### Python's memory model — what's actually defined
+
+The Python language specification is **vague** about cross-thread memory ordering. CPython's *de facto* model:
+
+- The GIL provides **sequential consistency for Python-level operations** within and between threads — when thread B acquires the GIL after A releases it, B sees A's writes.
+- Once you drop into C extensions that release the GIL and operate on shared memory (e.g. shared NumPy arrays mutated by multiple threads via different libraries), **you're on your own** — those follow the C/C++ memory model and need their own synchronization.
+- There is no language-level `volatile`, `acquire/release`, or memory-barrier primitive. Python doesn't expose one because the GIL hides the question.
+- Variables in `threading.local()` are per-thread storage — useful for cache state that shouldn't cross threads.
+
+For shared mutable state across threads, the right primitives:
+
+| Primitive                          | Use for                                      |
+|------------------------------------|----------------------------------------------|
+| `threading.Lock`                   | Mutual exclusion (the default)               |
+| `threading.RLock`                  | Reentrant lock — same thread can acquire twice |
+| `threading.Event`                  | One-shot signal between threads              |
+| `threading.Condition`              | Wait-for-state-change patterns               |
+| `threading.Semaphore`              | Bounded resource pool                        |
+| `queue.Queue`                      | Producer/consumer (already thread-safe)      |
+| `concurrent.futures.ThreadPoolExecutor` | Fan-out without managing threads        |
+
+### Reference counting + cycle GC
+
+Two memory-reclamation mechanisms work together in CPython:
+
+1. **Reference counting** (immediate). When refcount hits 0, the object is freed *now*. Predictable and deterministic.
+2. **Generational cyclic GC** (`gc` module). Refcounting can't free **reference cycles** (`a.b = b; b.a = a` — neither's count ever hits 0). The cycle collector runs periodically, finds unreachable cycles, and frees them.
+
+```python
+import gc
+gc.collect()        # force a full collection
+gc.disable()        # disable the cycle collector (refcounting still runs)
+gc.get_threshold()  # generation thresholds (default 700, 10, 10)
+```
+
+Practical implications:
+- **Most objects are freed deterministically** by refcounting, the moment their last reference disappears. This is why `with open(...) as f` works without explicit cleanup.
+- **Cycles delay freeing** until the GC runs. If you have huge object graphs with cycles (e.g. parent↔child trees), explicit `del` or breaking the cycle is faster than waiting for GC.
+- **`__del__` finalizers + cycles** used to be a footgun (uncollectable). Since 3.4 (PEP 442), Python can finalize objects in cycles, but `__del__` is still discouraged — prefer `with` / `__exit__` / `weakref.finalize`.
+
+### `weakref` — references that don't keep objects alive
+
+```python
+import weakref
+class Big: pass
+b = Big()
+r = weakref.ref(b)
+r()                 # <Big object> while b alive
+del b
+r()                 # None — object collected
+```
+
+Used for caches, observer registrations, parent pointers in trees — anywhere you don't want the reference itself to prevent collection.
+
+### NumPy / PyTorch and the GIL
+
+These libraries release the GIL during heavy operations:
+```python
+import numpy as np
+a = np.random.randn(2000, 2000)
+b = np.random.randn(2000, 2000)
+np.dot(a, b)        # NumPy drops the GIL here; another thread can run Python concurrently
+```
+
+This is why threading **does** help for NumPy/Torch workloads even though the work is "CPU-bound" from Python's perspective. The CPU-bound work is happening in C/Fortran, with the GIL released.
+
+But: **element-wise pure-Python loops over arrays do NOT release the GIL**. `for x in array: ...` is back to bytecode, single-threaded.
+
+### The free-threaded build (PEP 703, 3.13+)
+
+CPython 3.13 ships an experimental **`--disable-gil`** build (also called *free-threaded* or *nogil*). True multi-threaded Python:
+- Refcounts use atomic operations or biased reference counting.
+- Containers (dict, list, set) gain per-object locks.
+- Single-threaded performance regression has been narrowed to ~few %.
+- Many C extensions don't yet support it — opt in per-package.
+
+Status as of 2026: still experimental, but rapidly maturing. A growing number of scientific libraries (NumPy, PyTorch) ship free-threaded wheels. The GIL build remains the default; you opt in to the no-GIL build at compile time.
+
+When it lands as default, threaded pure-Python code becomes the natural way to use multiple cores — but until then, `multiprocessing` is still the answer for CPU-bound pure Python.
+
+### Common pitfalls
+
+- **Assuming `+=` is atomic.** It isn't. Use a lock or `queue.Queue`.
+- **"My threaded code uses 100% of one core, the others are idle."** Expected — that's the GIL doing its job. Switch to multiprocessing or release-GIL libraries.
+- **Catching the exception inside a finalizer (`__del__`) and swallowing.** Errors in `__del__` are ignored and printed to stderr; can mask real bugs. Avoid `__del__`.
+- **Holding a lock across a slow / blocking call.** Reduces concurrency to serial. Acquire late, release early; never `await` while holding a non-async lock.
+- **Mixing `threading.local()` with thread pools.** Threads in a pool are reused across tasks, so locals leak between tasks. Don't use thread-locals for per-task state in a pool.
+- **Relying on GC timing.** Don't depend on `__del__` running at a specific moment. Use explicit `close()` / context managers for resources.
+- **Memory leaks from cycles + large objects.** Force `gc.collect()` after big graphs go out of scope, or break cycles explicitly with `weakref` for back-pointers.
+- **Sharing NumPy arrays across threads with concurrent writes.** The GIL does **not** protect you — element writes happen in C with the GIL released. Either lock, partition, or use one writer + many readers.
+
+### TL;DR
+
+> The GIL is a single mutex around the CPython interpreter — it makes refcounting cheap and Python single-bytecode-atomic, but kills pure-Python parallelism. It's released around I/O and inside well-written C extensions, which is why threading helps NumPy and `requests` but not `for` loops. Read-modify-write isn't atomic — `+=` needs a lock. Memory is reclaimed mostly by refcounting, with a cycle collector backstop. The 3.13+ free-threaded build will eventually change the rules, but until it's default, design for the GIL.
