@@ -2084,3 +2084,315 @@ When it lands as default, threaded pure-Python code becomes the natural way to u
 ### TL;DR
 
 > The GIL is a single mutex around the CPython interpreter — it makes refcounting cheap and Python single-bytecode-atomic, but kills pure-Python parallelism. It's released around I/O and inside well-written C extensions, which is why threading helps NumPy and `requests` but not `for` loops. Read-modify-write isn't atomic — `+=` needs a lock. Memory is reclaimed mostly by refcounting, with a cycle collector backstop. The 3.13+ free-threaded build will eventually change the rules, but until it's default, design for the GIL.
+
+## 32. Typing & Protocols
+
+### Type hints don't run
+
+Python type hints are **inert at runtime** — the interpreter doesn't enforce them. They're consumed by type checkers (mypy, pyright/Pylance, pyre, pytype), IDEs, and tools like Pydantic / dataclasses. CPython does parse and store them (in `__annotations__`), but it never raises on a mismatch.
+
+```python
+def add(a: int, b: int) -> int:
+    return a + b
+
+add("a", "b")    # runs fine — produces "ab". Type checker would flag it.
+```
+
+So treat typing as a **design and review tool**, not a safety net.
+
+### Built-in generics — modern syntax
+
+| Old (still works)               | Modern (3.9+ / 3.10+)            |
+|---------------------------------|----------------------------------|
+| `List[int]` / `Dict[str, int]`  | `list[int]` / `dict[str, int]`   |
+| `Tuple[int, str]`               | `tuple[int, str]`                |
+| `Optional[int]`                 | `int \| None`                    |
+| `Union[int, str]`               | `int \| str`                     |
+| `Type[Foo]`                     | `type[Foo]`                      |
+
+```python
+def first(xs: list[int]) -> int | None:
+    return xs[0] if xs else None
+```
+
+`from __future__ import annotations` (3.7+) makes all annotations strings (lazy-evaluated), letting you use modern syntax even on older Python.
+
+### `typing` essentials
+
+```python
+from typing import (
+    Any, Callable, Iterable, Iterator, Sequence, Mapping, MutableMapping,
+    Optional, Union, Literal, Final, ClassVar, TypeAlias, NewType,
+    TypeVar, Generic, ParamSpec, Concatenate, Self,
+    Protocol, runtime_checkable, TypedDict, NamedTuple,
+    overload, cast, assert_type, assert_never, no_type_check,
+)
+```
+
+### `Any` vs `object` vs unset
+
+- `Any` — opt out of checking. Type checker stops complaining; you lose all guarantees.
+- `object` — the top type. You can pass anything in, but you can't *do* anything with it without narrowing.
+- No annotation — most checkers treat it as `Any` in lenient mode, or flag it in strict mode.
+
+Reach for `Any` only at boundaries (untyped third-party APIs); prefer `object` + narrowing for "we don't know yet."
+
+### Type aliases
+
+```python
+# old
+from typing import TypeAlias
+Vector: TypeAlias = list[float]
+
+# 3.12+: type statement (PEP 695) — preferred
+type Vector = list[float]
+type Matrix = list[Vector]
+type JSON = None | bool | int | float | str | list["JSON"] | dict[str, "JSON"]
+```
+
+Aliases are documentation — they don't create new types. For a *distinct* type the checker enforces, use `NewType`:
+
+```python
+from typing import NewType
+UserId = NewType("UserId", int)
+
+def get_user(uid: UserId) -> ...: ...
+get_user(123)                # type error: int is not UserId
+get_user(UserId(123))        # ok
+```
+
+`NewType` is zero-cost at runtime (just a callable returning its argument).
+
+### Literal & Final
+
+```python
+from typing import Literal, Final
+
+def open_file(mode: Literal["r", "w", "a"]) -> ...: ...
+open_file("rw")              # type error
+
+MAX_SIZE: Final = 1024       # checker forbids reassignment
+PI: Final[float] = 3.14
+```
+
+### Generics — `TypeVar` and `Generic`
+
+```python
+from typing import TypeVar, Generic
+
+T = TypeVar("T")
+class Stack(Generic[T]):
+    def __init__(self) -> None:
+        self._xs: list[T] = []
+    def push(self, x: T) -> None: self._xs.append(x)
+    def pop(self) -> T: return self._xs.pop()
+
+s: Stack[int] = Stack()
+s.push(1); s.pop()           # int
+```
+
+3.12+ syntax (PEP 695) — no need for explicit `TypeVar`:
+```python
+class Stack[T]:
+    def __init__(self) -> None: self._xs: list[T] = []
+    def push(self, x: T) -> None: self._xs.append(x)
+    def pop(self) -> T: return self._xs.pop()
+
+def first[T](xs: list[T]) -> T | None:
+    return xs[0] if xs else None
+```
+
+#### Bounded and constrained TypeVars
+```python
+from typing import TypeVar
+N = TypeVar("N", bound=float)         # any subtype of float
+S = TypeVar("S", str, bytes)          # exactly str OR bytes
+```
+
+#### `ParamSpec` — preserve full call signatures
+```python
+from typing import Callable, ParamSpec, TypeVar
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def log_calls(f: Callable[P, R]) -> Callable[P, R]:
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+        print(f.__name__)
+        return f(*args, **kwargs)
+    return wrapper
+```
+
+This is what makes typed decorators work without losing the wrapped function's signature.
+
+### Protocols — structural / "duck" typing
+
+`Protocol` (PEP 544) lets you type duck-typed code: a value matches a `Protocol` if it has the right **shape**, regardless of inheritance.
+
+```python
+from typing import Protocol
+
+class Reader(Protocol):
+    def read(self, n: int) -> bytes: ...
+
+def consume(r: Reader) -> bytes:
+    return r.read(1024)
+
+# Anything with a matching read() satisfies Reader — no inheritance required
+consume(open("f", "rb"))
+consume(io.BytesIO(b"data"))
+```
+
+Compare with **nominal typing** (`abc.ABC` / `isinstance`): with a `Protocol`, you don't need the third-party class to know about your interface. This is how you write contracts for code you don't own.
+
+#### `@runtime_checkable` — when you need `isinstance`
+```python
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Closeable(Protocol):
+    def close(self) -> None: ...
+
+isinstance(open("f"), Closeable)       # True
+```
+
+Caveats: runtime checks only verify **method names**, not signatures or types — they're a best-effort smoke test, not real validation.
+
+### `TypedDict` — typed dict shapes
+
+For dicts that act like lightweight structs (JSON payloads, config blobs):
+
+```python
+from typing import TypedDict, NotRequired
+
+class User(TypedDict):
+    id: int
+    name: str
+    email: NotRequired[str]            # 3.11+, optional key
+
+u: User = {"id": 1, "name": "alice"}   # ok
+u2: User = {"id": "x", "name": "a"}    # type error
+```
+
+3.12+ also supports `class User(TypedDict, total=False):` for all-optional, or marking individual keys with `Required[T]` / `NotRequired[T]`.
+
+### `Self` — the "this class" type (3.11+)
+
+For methods that return `self` (builders, fluent APIs) or factory classmethods:
+
+```python
+from typing import Self
+
+class Builder:
+    def with_x(self, v: int) -> Self:
+        self.x = v
+        return self
+    @classmethod
+    def empty(cls) -> Self:
+        return cls()
+```
+
+Subclasses inherit the right return type automatically — `SubBuilder.with_x()` is typed as `SubBuilder`, not `Builder`.
+
+### `@overload` — multiple signatures for one function
+
+```python
+from typing import overload
+
+@overload
+def get(key: str) -> str: ...
+@overload
+def get(key: str, default: int) -> str | int: ...
+
+def get(key, default=None):                # the actual implementation
+    return STORE.get(key, default)
+```
+
+Only the implementation runs; the `@overload` stubs exist only for the type checker. Use when the return type genuinely depends on argument types/values.
+
+### Type narrowing
+
+Type checkers narrow types based on guards:
+
+```python
+def f(x: int | str) -> str:
+    if isinstance(x, int):
+        return str(x)               # x narrowed to int here
+    return x.upper()                # x narrowed to str here
+
+def g(x: int | None) -> int:
+    if x is None: raise ValueError
+    return x + 1                    # x is int here
+
+# TypeGuard — custom narrowing function (3.10+)
+from typing import TypeGuard
+def is_str_list(xs: list[object]) -> TypeGuard[list[str]]:
+    return all(isinstance(x, str) for x in xs)
+
+# 3.13+: TypeIs is the stricter, more accurate replacement for TypeGuard
+```
+
+### `typing` vs `collections.abc`
+
+For function parameters, prefer **abstract** types so callers can pass any compatible iterable:
+
+```python
+from collections.abc import Iterable, Mapping, Sequence
+
+def total(xs: Iterable[int]) -> int:        # accepts list, tuple, generator, set...
+    return sum(xs)
+```
+
+Use the concrete type (`list`, `dict`) only when you actually need the concrete API (mutation, indexing).
+
+### Variance — when does `List[Sub]` count as `List[Base]`?
+
+| Variance        | `Container[Sub] → Container[Base]` allowed? | Example                         |
+|-----------------|--------------------------------------------|---------------------------------|
+| **Covariant**   | Yes (read-only producers)                  | `Sequence[Dog] → Sequence[Animal]` |
+| **Contravariant** | Reversed — `[Base] → [Sub]` (consumers)  | `Callable[[Animal], None] → Callable[[Dog], None]` |
+| **Invariant**   | No (mutable containers)                    | `list[Dog] ≠ list[Animal]`      |
+
+`list` is invariant because `xs: list[Animal] = list_of_dogs; xs.append(Cat())` would corrupt the typing. Use `Sequence` (covariant, read-only) when you only consume.
+
+### Useful escape hatches
+
+```python
+from typing import cast, assert_type, assert_never, TYPE_CHECKING
+
+x = cast(int, get_value())              # tell checker "trust me, this is int"
+
+assert_type(x, int)                     # checker assertion only — runtime no-op
+
+def handle(cmd: Literal["a", "b"]) -> None:
+    if cmd == "a": ...
+    elif cmd == "b": ...
+    else: assert_never(cmd)             # exhaustiveness check; type error if reachable
+
+if TYPE_CHECKING:
+    from heavy_module import BigType    # only imported by type checker
+```
+
+### Common pitfalls
+
+- **Believing annotations enforce anything.** They don't. Add validation at boundaries (Pydantic, manual checks), not via `: int`.
+- **Mutable default annotations.** `def f(xs: list[int] = []):` still has the shared-mutable-default bug — typing doesn't fix it.
+- **Forgetting `from __future__ import annotations` (or 3.10+) before using `int | str`.** Older versions raise `TypeError` at definition time on the `|` syntax in non-annotation contexts.
+- **String forward references in unusual places.** `field: "MyClass"` works; `isinstance(x, "MyClass")` does not. Quotes only help in annotations.
+- **Confusing `Protocol` with `ABC`.** `Protocol` is structural — no inheritance required. `ABC` is nominal — you must subclass.
+- **Using `Any` to silence the checker.** It propagates: `Any` infects everything it touches. Prefer `object` + narrowing, or fix the underlying type.
+- **`runtime_checkable` Protocols don't check signatures.** A class with a `read()` method that takes no args matches `Reader` at runtime even though it'll crash when called.
+- **List of subclass passed where list of base expected.** Variance: use `Sequence[Base]` for read-only params, not `list[Base]`.
+- **Forgetting `Self` and hard-coding the class name.** `def clone(self) -> "Foo":` breaks subclasses; `def clone(self) -> Self:` doesn't.
+- **Annotations that import circularly.** Use `if TYPE_CHECKING:` + string annotations, or `from __future__ import annotations`.
+
+### When to bother
+
+Type hints pay off when:
+- The codebase has 2+ contributors or will outlive your memory of it.
+- You're building a library — hints are documentation users see in their IDE.
+- You're refactoring — a checker catches mismatches the test suite misses.
+- You're touching glue code with messy data shapes — `TypedDict` and `Literal` make the shapes legible.
+
+They pay off less for:
+- One-off scripts.
+- Heavy NumPy/Tensor code where shape, not type, is the real constraint (consider `jaxtyping` / `nptyping` / runtime shape asserts).
