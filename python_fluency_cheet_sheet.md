@@ -1488,3 +1488,225 @@ Dog()      # ok
 ### TL;DR
 
 > A metaclass is the class of a class. You almost never need one — `__init_subclass__` (subclass hook), class decorators (post-build mutation), and descriptors (per-attribute behavior) cover the vast majority of "I want something to happen when a class is defined" use cases. Reach for a metaclass only when you must intercept class **creation** itself.
+
+## 29. Descriptors & `__get__` / `__set__`
+
+### What a descriptor is
+
+A **descriptor** is any object that defines at least one of `__get__`, `__set__`, `__delete__`. When such an object is stored as a **class attribute** (not an instance attribute), Python intercepts attribute access on instances and routes it through the descriptor's methods.
+
+This is the underlying machinery behind `property`, `classmethod`, `staticmethod`, `super()`, and bound methods themselves.
+
+```python
+class Quiet:
+    def __get__(self, instance, owner):
+        return 42
+
+class C:
+    x = Quiet()                 # class attribute → descriptor
+
+C().x      # 42  — Python called Quiet().__get__(c_instance, C)
+```
+
+### The descriptor protocol
+
+| Method                                | Fires when                  | Signature                            |
+|---------------------------------------|-----------------------------|--------------------------------------|
+| `__get__(self, instance, owner)`      | `obj.attr` or `Cls.attr`    | `instance` is `None` for class access |
+| `__set__(self, instance, value)`      | `obj.attr = value`          | —                                    |
+| `__delete__(self, instance)`          | `del obj.attr`              | —                                    |
+| `__set_name__(self, owner, name)`     | At class creation (3.6+)    | Tells the descriptor its attribute name |
+
+### Data vs non-data descriptors — the lookup rule
+
+This distinction governs **which wins** in attribute lookup, instance `__dict__` or class-level descriptor:
+
+| Kind                | Defines                              | Priority                             |
+|---------------------|--------------------------------------|--------------------------------------|
+| **Data descriptor** | `__set__` (and/or `__delete__`)      | **Wins over** instance `__dict__`    |
+| **Non-data**        | only `__get__`                       | **Loses to** instance `__dict__`     |
+
+```python
+obj.attr   →
+    1. type(obj).__mro__ for a *data* descriptor named "attr"  → use it
+    2. obj.__dict__["attr"]                                    → use it
+    3. type(obj).__mro__ for a *non-data* descriptor or plain class attr  → use it
+    4. AttributeError (or __getattr__)
+```
+
+This is why `property` (data descriptor) can't be shadowed by setting `obj.x = ...`, but methods (non-data) **can** be — assigning `obj.method = something` overrides the class method on that one instance.
+
+### `__set_name__` — descriptor learns its attribute name
+
+Without it, a descriptor doesn't know what name it was assigned to. With it (PEP 487, 3.6+), the descriptor can store data on the instance under a per-attribute key:
+
+```python
+class Typed:
+    def __init__(self, expected):
+        self.expected = expected
+
+    def __set_name__(self, owner, name):
+        self.name = name                                # remembers attribute name
+        self.private = f"_{name}"
+
+    def __get__(self, instance, owner):
+        if instance is None:
+            return self                                 # class access: return the descriptor itself
+        return instance.__dict__[self.private]
+
+    def __set__(self, instance, value):
+        if not isinstance(value, self.expected):
+            raise TypeError(f"{self.name} must be {self.expected.__name__}")
+        instance.__dict__[self.private] = value
+
+class Person:
+    name = Typed(str)
+    age  = Typed(int)
+
+p = Person()
+p.name = "alice"      # ok
+p.age = "30"          # TypeError: age must be int
+```
+
+The `if instance is None: return self` branch is the convention for class-level access (`Person.name`) so introspection works.
+
+### `property` is just a descriptor
+
+`@property` is a built-in data descriptor. The hand-rolled equivalent:
+
+```python
+class Property:
+    def __init__(self, fget=None, fset=None):
+        self.fget, self.fset = fget, fset
+    def __get__(self, instance, owner):
+        if instance is None: return self
+        return self.fget(instance)
+    def __set__(self, instance, value):
+        if self.fset is None: raise AttributeError("read-only")
+        self.fset(instance, value)
+    def setter(self, fset):
+        return type(self)(self.fget, fset)
+
+class C:
+    @Property
+    def x(self): return self._x
+    @x.setter
+    def x(self, v): self._x = v
+```
+
+Real `property` adds `__delete__`, docstring forwarding, and `fdel`, but the shape is identical.
+
+### Methods are non-data descriptors
+
+A function is a descriptor — its `__get__` returns a **bound method**:
+
+```python
+class C:
+    def hi(self): return "hi"
+
+C.hi              # <function C.hi>      — unbound, the function itself
+C().hi            # <bound method C.hi>  — produced via function.__get__(instance, C)
+C().hi()          # "hi"
+```
+
+`classmethod` and `staticmethod` are also descriptors — their `__get__` returns a method bound to the class, or the raw function, respectively.
+
+### Common patterns
+
+#### Validation / type-checked attributes
+The `Typed` example above. Used by libraries like attrs, Pydantic v1, SQLAlchemy columns.
+
+#### Lazy / cached attribute (compute once, store on instance)
+
+```python
+class lazy_property:
+    def __init__(self, func):
+        self.func = func
+    def __set_name__(self, owner, name):
+        self.name = name
+    def __get__(self, instance, owner):
+        if instance is None: return self
+        value = self.func(instance)
+        instance.__dict__[self.name] = value         # shadows descriptor next time
+        return value
+
+class Doc:
+    @lazy_property
+    def parsed(self):
+        print("computing...")
+        return expensive_parse(self.raw)
+
+d = Doc()
+d.parsed     # prints "computing...", caches result
+d.parsed     # cache hit, no print
+```
+
+This works **only because `lazy_property` is a non-data descriptor** (no `__set__`) — the cached value in `instance.__dict__` shadows it on subsequent reads. The stdlib ships this as `functools.cached_property` (3.8+).
+
+#### Read-only attribute
+Define `__set__` to always raise:
+```python
+class ReadOnly:
+    def __init__(self, value): self.value = value
+    def __get__(self, inst, owner): return self.value
+    def __set__(self, inst, value): raise AttributeError("read-only")
+```
+
+#### Per-instance storage without `__set_name__`
+Pre-3.6 (or for compatibility), descriptors used a `WeakKeyDictionary` keyed by instance:
+```python
+import weakref
+class Attr:
+    def __init__(self): self._data = weakref.WeakKeyDictionary()
+    def __get__(self, inst, owner):
+        return self if inst is None else self._data.get(inst)
+    def __set__(self, inst, value):
+        self._data[inst] = value
+```
+Modern code prefers `__set_name__` + `instance.__dict__`.
+
+### Where descriptors live
+
+Descriptors **only fire when stored as class attributes**. Putting one in `instance.__dict__` does nothing special:
+
+```python
+class C: pass
+c = C()
+c.x = property(lambda self: 42)     # NOT a descriptor here
+c.x                                  # <property object>, not 42
+```
+
+This is why properties must be defined on the class, not assigned per-instance.
+
+### `__getattr__` / `__getattribute__` / descriptor — order of operations
+
+`object.__getattribute__` is what implements the lookup rule above. Override it only if you really need to (rare). `__getattr__` is the **fallback** — it's called only when normal lookup (including descriptors) fails with `AttributeError`.
+
+```
+obj.attr
+   ↓
+__getattribute__  (handles descriptors, __dict__, MRO)
+   ↓ raises AttributeError?
+__getattr__       (fallback hook)
+```
+
+### Common pitfalls
+
+- **Storing per-instance state on the descriptor itself.** A descriptor is a single object shared by all instances of the owner class — `self.value = v` inside `__set__` overwrites for everyone. Always store on `instance.__dict__` (use `__set_name__`) or a per-instance keyed structure.
+- **Forgetting `if instance is None: return self`.** Without it, `Cls.attr` calls `__get__(None, Cls)` and behavior is undefined / crashes. The convention is to return the descriptor for class access so `inspect`/`dir` work.
+- **Confusing data vs non-data priority.** Adding `__set__` flips the priority — your "lazy" cache that stored into `instance.__dict__` will silently stop caching the moment you add a `__set__`.
+- **Defining descriptors as instance attributes.** They only work as **class** attributes. `self.attr = MyDescriptor()` in `__init__` does not engage the protocol.
+- **Naming clashes between descriptor key and attribute.** If `__set_name__` stores under the same key (`instance.__dict__[self.name]`) AND the descriptor is non-data, the instance dict wins on subsequent reads and the descriptor never fires again. Use a different key (`f"_{name}"`) or make it a data descriptor.
+- **Using a mutable default keyed by instance.** `WeakKeyDictionary` only works if the instance is weak-referenceable (most user classes are; some built-ins and `__slots__` classes without `__weakref__` are not).
+- **Reading `obj.method` and storing it for later** — that's fine, but reassigning `obj.method = other` shadows it because methods are non-data descriptors. For a method that *cannot* be shadowed per-instance, define a data descriptor explicitly.
+
+### When to reach for what
+
+| Need                                                       | Use                              |
+|------------------------------------------------------------|----------------------------------|
+| Computed attribute, no per-instance setter logic           | `@property`                      |
+| Compute once, then cache on instance                       | `functools.cached_property`      |
+| Same validation/conversion across many attributes          | Custom data descriptor           |
+| Read-only constant on class                                | Plain class attribute (or descriptor with `__set__` raising) |
+| Replace **all** attribute access dynamically               | `__getattr__` (fallback) or `__getattribute__` (heavy hammer) |
+| Cross-cutting attribute behavior in a framework            | Descriptor + `__set_name__`      |
