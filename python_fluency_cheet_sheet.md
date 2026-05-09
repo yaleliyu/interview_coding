@@ -1309,3 +1309,182 @@ Prefer `__iter__` for new code — it's the explicit protocol and supports non-i
 | Container is iterable multiple times in parallel         | **Container with `__iter__` returning a fresh iterator** (generator inside is fine) |
 | Wrapping a callable / file / socket via sentinel         | `iter(callable, sentinel)` |
 | Composing/transforming existing iterables                | **Generator expression / `itertools`** |
+
+## 28. Metaclasses & `__init_subclass__`
+
+### Metaclasses in one sentence
+
+A class is an **object**, and its **type** is its metaclass. Just as `instance.__class__` is a class, `class.__class__` is a metaclass — and the default metaclass is `type`.
+
+```python
+class Foo: pass
+
+type(Foo())     # <class 'Foo'>      — Foo is the type of its instances
+type(Foo)       # <class 'type'>     — type is the metaclass of Foo
+type(type)      # <class 'type'>     — type is its own type (the bedrock)
+```
+
+So `type` is overloaded: it both **inspects** an object's class and **creates** new classes. The 3-arg form is the class constructor:
+
+```python
+# These two are equivalent:
+class Foo:
+    x = 1
+    def hi(self): return "hi"
+
+Foo = type("Foo", (), {"x": 1, "hi": lambda self: "hi"})
+```
+
+### What a metaclass is for
+
+A metaclass customizes **class creation** — code that runs when the `class` statement executes, not when an instance is created. Use cases:
+
+- **Registries** — auto-collect every subclass into a registry.
+- **Validation** — enforce that subclasses define required methods/attributes.
+- **Auto-injection** — add methods, generated attributes, or `__slots__`.
+- **Frameworks** — Django models, SQLAlchemy declarative base, ABCs, enum, dataclasses (sort of), Pydantic v1.
+
+If you don't need to customize class creation itself, **don't reach for a metaclass.** Most of the time `__init_subclass__`, decorators, or descriptors are simpler and sufficient.
+
+### Defining a metaclass
+
+```python
+class Meta(type):
+    def __new__(mcls, name, bases, namespace, **kwargs):
+        # runs BEFORE the class is created — can rewrite namespace
+        namespace["created_by"] = "Meta"
+        cls = super().__new__(mcls, name, bases, namespace)
+        return cls
+
+    def __init__(cls, name, bases, namespace, **kwargs):
+        # runs AFTER the class is created
+        super().__init__(name, bases, namespace)
+
+    def __call__(cls, *args, **kwargs):
+        # runs when the CLASS is called (i.e. instance creation)
+        print(f"creating instance of {cls.__name__}")
+        return super().__call__(*args, **kwargs)
+
+class Foo(metaclass=Meta):
+    pass
+
+Foo.created_by      # "Meta"
+Foo()               # prints "creating instance of Foo"
+```
+
+The four hooks, in order of when they fire:
+
+| Hook                  | Fires when                  | Receives                        |
+|-----------------------|-----------------------------|---------------------------------|
+| `Meta.__prepare__`    | Before class body runs      | Returns the namespace dict (e.g. `OrderedDict`) |
+| `Meta.__new__`        | Class object is created     | `(mcls, name, bases, namespace)` |
+| `Meta.__init__`       | Class object is initialized | Same as `__new__`               |
+| `Meta.__call__`       | The class itself is called  | `(cls, *args, **kw)` — controls instance creation |
+
+### `__init_subclass__` — the lightweight alternative (3.6+)
+
+90% of metaclass use cases are subclass customization. PEP 487 added `__init_subclass__` as a **classmethod hook on the parent** that runs every time a subclass is created — no metaclass required.
+
+```python
+class Plugin:
+    registry = {}
+
+    def __init_subclass__(cls, *, name=None, **kwargs):
+        super().__init_subclass__(**kwargs)
+        key = name or cls.__name__.lower()
+        Plugin.registry[key] = cls
+
+class Csv(Plugin, name="csv"): ...        # auto-registered as "csv"
+class Json(Plugin): ...                   # auto-registered as "json"
+
+Plugin.registry      # {"csv": Csv, "json": Json}
+```
+
+Notes:
+- It is **implicitly a classmethod**, even without the decorator.
+- Keyword args in the `class` line (`class Csv(Plugin, name="csv")`) flow into `__init_subclass__` as kwargs.
+- It does **not** fire for the base class itself, only for subclasses.
+- Always call `super().__init_subclass__(**kwargs)` so cooperative chains work.
+
+### Side-by-side: registry pattern
+
+**Metaclass version**
+```python
+class RegistryMeta(type):
+    registry = {}
+    def __init__(cls, name, bases, ns):
+        super().__init__(name, bases, ns)
+        if bases:                         # skip the base
+            RegistryMeta.registry[name] = cls
+
+class Plugin(metaclass=RegistryMeta): pass
+class A(Plugin): pass
+class B(Plugin): pass
+```
+
+**`__init_subclass__` version** — same effect, no new metaclass:
+```python
+class Plugin:
+    registry = {}
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        Plugin.registry[cls.__name__] = cls
+```
+
+The second is shorter, easier to read, and composes better with other libraries.
+
+### When you actually need a metaclass
+
+Reach for a metaclass only when `__init_subclass__` and class decorators **can't** do it:
+
+- You need to **change the namespace before the class body executes** — e.g. provide an `OrderedDict` so attribute order is preserved (pre-3.7), or restrict allowed names. Use `__prepare__`.
+- You need to control **instance creation behavior across an entire hierarchy** by overriding `__call__` (singletons, caching, factory routing).
+- You need **custom isinstance / issubclass behavior** — override `__instancecheck__` / `__subclasscheck__` (this is how `abc.ABCMeta` works).
+- You're building a framework where users **shouldn't** have to inherit from a magic base class — but even then, prefer a class decorator first.
+
+### Class decorator — usually the right answer
+
+A class decorator runs **after** the class is built, can mutate it freely, and stacks cleanly with others:
+
+```python
+def register(cls):
+    REGISTRY[cls.__name__] = cls
+    return cls
+
+@register
+class A: ...
+```
+
+Decision order: **class decorator → `__init_subclass__` → metaclass**. Only escalate when the previous tier can't express what you need.
+
+### `ABCMeta` — the canonical metaclass in the stdlib
+
+```python
+from abc import ABC, abstractmethod
+
+class Animal(ABC):
+    @abstractmethod
+    def speak(self): ...
+
+class Dog(Animal):
+    def speak(self): return "woof"
+
+Animal()   # TypeError: Can't instantiate abstract class
+Dog()      # ok
+```
+
+`ABC` is just `class ABC(metaclass=ABCMeta)`. The metaclass enforces that any class with unimplemented `@abstractmethod` cannot be instantiated, and adds `register()` for virtual subclasses.
+
+### Common pitfalls
+
+- **Metaclass conflicts in multiple inheritance.** If two bases have different metaclasses, Python raises `TypeError: metaclass conflict`. The combined metaclass must be a subclass of both. This is one of the strongest arguments for avoiding metaclasses in libraries.
+- **Forgetting `super().__init_subclass__(**kwargs)`.** Breaks cooperative chains — sibling mixins silently don't run.
+- **Putting validation in `__new__` when `__init_subclass__` would do** — the latter is simpler, doesn't poison the metaclass, and composes.
+- **Trying to use `self` in a metaclass method.** Metaclass methods receive `cls` (the class being defined), not an instance — `cls` IS the "instance" from the metaclass's perspective.
+- **Confusing `Meta.__call__` with `cls.__call__`.** `Meta.__call__(cls, ...)` runs when you write `Foo(...)` and orchestrates `__new__` + `__init__`. `Foo.__call__(self, ...)` runs when you call an *instance*.
+- **Reading `__init_subclass__` as a regular method** — it's an implicit classmethod. Don't decorate it; don't call it on instances.
+- **Assuming order of hooks.** For a class with a metaclass `Meta` and a base with `__init_subclass__`: order is `Meta.__prepare__` → body executes → `Meta.__new__` → `Meta.__init__` → `base.__init_subclass__`.
+
+### TL;DR
+
+> A metaclass is the class of a class. You almost never need one — `__init_subclass__` (subclass hook), class decorators (post-build mutation), and descriptors (per-attribute behavior) cover the vast majority of "I want something to happen when a class is defined" use cases. Reach for a metaclass only when you must intercept class **creation** itself.
